@@ -1,5 +1,5 @@
 {
-  "latest_version": "1.0.0",
-  "download_url": "https://example.com/desktop-automation/%E6%A1%8C%E9%9D%A2%E8%87%AA%E5%8B%95%E5%8C%96%E5%B7%A5%E5%85%B7.exe",
-  "notes": "初始版本"
+  "latest_version": "1.0.1",
+  "download_url": "https://github.com/lanlan0214/CheatBot/releases/latest/download/%E6%A1%8C%E9%9D%A2%E8%87%AA%E5%8B%95%E5%8C%96%E5%B7%A5%E5%85%B7.exe",
+  "notes": "修正更新檢查 SSL 憑證相容性，提升 Windows 環境更新成功率"
 }

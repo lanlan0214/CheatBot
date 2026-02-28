@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # 線上更新網址（支援兩種）
 # 1) GitHub Releases latest API（推薦）

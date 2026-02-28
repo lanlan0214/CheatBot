@@ -4,7 +4,9 @@ import sys
 import tempfile
 from pathlib import Path
 from urllib import request
+from urllib.error import URLError
 import json
+import ssl
 
 
 def _normalize_version(version: str) -> tuple[int, ...]:
@@ -34,7 +36,7 @@ def _http_get_json(url: str, timeout: int = 8) -> dict:
         headers={"User-Agent": "desktop-automation-updater/1.0"},
         method="GET",
     )
-    with request.urlopen(req, timeout=timeout) as resp:
+    with _open_url(req, timeout=timeout) as resp:
         if resp.status != 200:
             raise RuntimeError(f"HTTP {resp.status}")
         data = resp.read().decode("utf-8", errors="replace")
@@ -42,6 +44,34 @@ def _http_get_json(url: str, timeout: int = 8) -> dict:
     if not isinstance(payload, dict):
         raise RuntimeError("更新資訊格式錯誤")
     return payload
+
+
+def _is_ssl_verify_error(error: Exception) -> bool:
+    reason = getattr(error, "reason", None)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return True
+    text = str(error).upper()
+    return "CERTIFICATE_VERIFY_FAILED" in text
+
+
+def _open_url(req: request.Request, timeout: int):
+    try:
+        return request.urlopen(req, timeout=timeout)
+    except Exception as first_error:
+        if not _is_ssl_verify_error(first_error):
+            raise
+
+        try:
+            import certifi
+
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            return request.urlopen(req, timeout=timeout, context=ctx)
+        except Exception as second_error:
+            raise RuntimeError(
+                "SSL 憑證驗證失敗，請更新系統憑證或安裝最新版工具後重試。"
+            ) from second_error
 
 
 def _pick_github_release_asset(assets: list, preferred_name: str = "") -> str:
@@ -134,7 +164,7 @@ def _download_file(url: str, output_path: Path, timeout: int = 20) -> None:
         headers={"User-Agent": "desktop-automation-updater/1.0"},
         method="GET",
     )
-    with request.urlopen(req, timeout=timeout) as resp, open(output_path, "wb") as out:
+    with _open_url(req, timeout=timeout) as resp, open(output_path, "wb") as out:
         if resp.status != 200:
             raise RuntimeError(f"下載更新檔失敗: HTTP {resp.status}")
         shutil.copyfileobj(resp, out)

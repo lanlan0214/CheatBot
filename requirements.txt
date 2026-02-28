@@ -1,3 +1,4 @@
 pyautogui
 pygetwindow
 pywin32
+certifi

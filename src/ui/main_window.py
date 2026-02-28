@@ -13,15 +13,56 @@ from tkinter import ttk
 from tkinter import filedialog, messagebox
 import time
 import json
+import random
 import threading
 import sys
 import webbrowser
 
+import ctypes
 import pyautogui
 import pygetwindow
+import win32api
 import win32gui
 import win32con
 import keyboard
+
+# ── SendInput helpers ────────────────────────────────────────────────────────
+# 使用硬體掃描碼送鍵事件，比 keybd_event 更接近真實硬體行為，
+# 能繞過大多數遊戲的 anti-cheat 過濾。
+_KEYEVENTF_SCANCODE = 0x0008
+_KEYEVENTF_KEYUP    = 0x0002
+_INPUT_KEYBOARD     = 1
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ('wVk',         ctypes.c_ushort),
+        ('wScan',       ctypes.c_ushort),
+        ('dwFlags',     ctypes.c_uint),
+        ('time',        ctypes.c_uint),
+        ('dwExtraInfo', ctypes.c_uint64),
+    ]
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ('type', ctypes.c_uint),
+        ('ki',   _KEYBDINPUT),
+    ]
+
+def _send_input_scancode(vk: int, keyup: bool = False) -> bool:
+    """透過 SendInput 以掃描碼形式送出鍵盤事件（最接近真實硬體）。"""
+    try:
+        scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
+        flags = _KEYEVENTF_SCANCODE | (_KEYEVENTF_KEYUP if keyup else 0)
+        inp = _INPUT(
+            type=_INPUT_KEYBOARD,
+            ki=_KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=0)
+        )
+        return ctypes.windll.user32.SendInput(
+            1, ctypes.byref(inp), ctypes.sizeof(_INPUT)
+        ) == 1
+    except Exception:
+        return False
+# ─────────────────────────────────────────────────────────────────────────────
 
 from core.win_background_input import BackgroundInput, parse_command_to_vk
 from core.update_manager import check_for_update, prepare_and_launch_update
@@ -255,10 +296,10 @@ class MainWindow:
             justify="left",
         ).grid(row=1, column=0, columnspan=3, sticky="w")
 
-        Label(macro_frame, text="長按秒數 (左/右各按住幾秒，例如 10)").grid(
+        Label(macro_frame, text="長按秒數 (例如 10 或 10-15 隨機範圍)").grid(
             row=2, column=0, sticky="w"
         )
-        self.hold_seconds_var = StringVar(value="10")
+        self.hold_seconds_var = StringVar(value="10-15")
         Entry(macro_frame, textvariable=self.hold_seconds_var, width=10).grid(
             row=3, column=0, pady=2, sticky="w"
         )
@@ -596,12 +637,20 @@ class MainWindow:
             return
 
         # 讀取設定
+        raw_hold = self.hold_seconds_var.get().strip()
         try:
-            hold_seconds = float(self.hold_seconds_var.get().strip() or "0")
-            if hold_seconds <= 0:
-                raise ValueError
+            if "-" in raw_hold:
+                parts = raw_hold.split("-", 1)
+                hold_min = float(parts[0].strip())
+                hold_max = float(parts[1].strip())
+                if hold_min <= 0 or hold_max <= 0 or hold_min > hold_max:
+                    raise ValueError
+            else:
+                hold_min = hold_max = float(raw_hold or "0")
+                if hold_min <= 0:
+                    raise ValueError
         except ValueError:
-            self.status_var.set("長按秒數格式錯誤，請輸入大於 0 的數字")
+            self.status_var.set("長按秒數格式錯誤，請輸入如 10 或 10-15")
             return
 
         try:
@@ -642,7 +691,7 @@ class MainWindow:
 
         self._worker_thread = threading.Thread(
             target=self._walk_cast_worker,
-            args=(hold_seconds, k_interval, switch_gap, skills, loop_forever),
+            args=(hold_min, hold_max, k_interval, switch_gap, skills, loop_forever),
             daemon=True,
         )
         self._worker_thread.start()
@@ -656,7 +705,8 @@ class MainWindow:
 
     def _walk_cast_worker(
         self,
-        hold_seconds: float,
+        hold_min: float,
+        hold_max: float,
         k_interval: float,
         switch_gap: float,
         skills: list[str],
@@ -703,22 +753,67 @@ class MainWindow:
                 pass
 
         def release_dir_key(dir_key: str):
-            """Best-effort release to prevent stuck keys (e.g., RIGHT still held).
-
-            On some games/windows the key-up for the opposite direction may not be
-            delivered, which results in continuous movement to one side.  To make
-            the macro more reliable we call this on *both* directions before
-            pressing the next one and again when we're done holding.
-            """
+            """Best-effort release to prevent stuck keys."""
             try:
+                vk = parse_command_to_vk(dir_key)
                 if bg_mode and hwnd:
-                    vk = parse_command_to_vk(dir_key)
                     if vk is not None:
                         BackgroundInput.send_vk(hwnd, vk, keyup=True)
                 else:
-                    pyautogui.keyUp(dir_key.lower())
+                    if vk is not None:
+                        # 優先用 SendInput 掃描碼（最接近硬體）
+                        if not _send_input_scancode(vk, keyup=True):
+                            try:
+                                win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+                            except Exception:
+                                pass
+                    try:
+                        keyboard.release(dir_key.lower())
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
+        def foreground_key_down(dir_key: str) -> str:
+            """Send key-down in foreground mode.
+
+            優先使用 SendInput + 掃描碼（最接近真實硬體，能繞過大部分 anti-cheat）。
+            失敗才降級到 keybd_event / keyboard / pyautogui。
+            Returns driver name for matching key-up.
+            """
+            vk = parse_command_to_vk(dir_key)
+            # 第一優先：SendInput scancode
+            if vk is not None and _send_input_scancode(vk, keyup=False):
+                return "sendinput"
+            # 第二：keybd_event
+            if vk is not None:
+                try:
+                    win32api.keybd_event(vk, 0, 0, 0)
+                    return "win32"
+                except Exception:
+                    pass
+            # 第三：keyboard
+            try:
+                keyboard.press(dir_key.lower())
+                return "keyboard"
+            except Exception:
+                pass
+            # 最後：pyautogui
+            pyautogui.keyDown(dir_key.lower())
+            return "pyautogui"
+
+        def foreground_key_up(dir_key: str, driver: str):
+            vk = parse_command_to_vk(dir_key)
+            if driver == "sendinput" and vk is not None:
+                _send_input_scancode(vk, keyup=True)
+                return
+            if driver == "win32" and vk is not None:
+                win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+                return
+            if driver == "keyboard":
+                keyboard.release(dir_key.lower())
+                return
+            pyautogui.keyUp(dir_key.lower())
 
         def release_all_dir_keys():
             release_dir_key("LEFT")
@@ -739,33 +834,76 @@ class MainWindow:
             skill_index += 1
             return key
 
-        def press_skill_once():
+        def press_skill_once(dir_key: str | None = None, dir_driver: str = "") -> str:
+            """按一次技能鍵，並回傳方向鍵的新 driver。
+
+            前景模式時先放開方向鍵，技能按完再重新按回去，
+            避免遊戲把同時多鍵當作機器人行為而過濾。
+            """
             if not cast_k:
-                return
+                return dir_driver
             skill = next_skill()
             if not skill:
-                return
+                return dir_driver
             try:
+                vk = parse_command_to_vk(skill)
                 if bg_mode and hwnd:
-                    vk = parse_command_to_vk(skill)
+                    # 背景模式不需要放開方向鍵（各自獨立 PostMessage）
                     if vk is not None:
                         BackgroundInput.press_vk(hwnd, vk, hold_seconds=0)
                 else:
-                    pyautogui.press(skill.lower())
+                    # ① 先放開方向鍵
+                    if dir_key:
+                        release_dir_key(dir_key)
+                        time.sleep(0.15)   # 人類放開方向鍵後的自然延遲
+
+                    # ② 確保遊戲視窗有焦點
+                    if hwnd:
+                        try:
+                            win32gui.SetForegroundWindow(hwnd)
+                            time.sleep(0.08)
+                        except Exception:
+                            pass
+
+                    # ③ 按技能鍵 — M2: keybd_event + scan碼（已驗證對楓之谷有效）
+                    if vk is not None:
+                        scan = win32api.MapVirtualKey(vk, 0)
+                        win32api.keybd_event(vk, scan, 0, 0)
+                        time.sleep(0.12)
+                        win32api.keybd_event(vk, scan, win32con.KEYEVENTF_KEYUP, 0)
+                    else:
+                        pyautogui.press(skill.lower())
+
+                    time.sleep(0.15)   # 放開技能鍵後稍停
+
+                    # ④ 重新按下方向鍵，回傳新的 driver
+                    if dir_key:
+                        new_driver = foreground_key_down(dir_key)
+                        return new_driver
             except Exception:
-                # 不要讓技能鍵失敗中斷整個宏
-                return
+                pass
+            return dir_driver
 
         def hold_dir(dir_key: str, seconds: float):
             start = time.monotonic()
-            last_k = 0.0
+            # 第一次技能延遲：先走一小段再按，避免與方向鍵按下時機太近
+            last_k = time.monotonic() + 0.3
             paused_total = 0.0
             key_is_down = False
+            fg_key_driver = ""
 
             try:
                 # 為了防止方向鍵同時被壓住或上一輪沒有正確放開，我們先放開
                 # 兩邊方向鍵，再開始按下當前方向。
                 release_all_dir_keys()
+
+                # 前景模式：確保遊戲視窗有焦點，鍵盤事件才會被接收
+                if not bg_mode and hwnd:
+                    try:
+                        win32gui.SetForegroundWindow(hwnd)
+                        time.sleep(0.12)  # 等視窗切換完成
+                    except Exception:
+                        pass
 
                 if bg_mode and hwnd:
                     vk = parse_command_to_vk(dir_key)
@@ -774,7 +912,7 @@ class MainWindow:
                     BackgroundInput.send_vk(hwnd, vk, keyup=False)
                     key_is_down = True
                 else:
-                    pyautogui.keyDown(dir_key.lower())
+                    fg_key_driver = foreground_key_down(dir_key)
                     key_is_down = True
 
                 while not self._stop_flag and (time.monotonic() - start - paused_total) < seconds:
@@ -796,12 +934,16 @@ class MainWindow:
                                 BackgroundInput.send_vk(hwnd, vk, keyup=False)
                                 key_is_down = True
                         else:
-                            pyautogui.keyDown(dir_key.lower())
+                            fg_key_driver = foreground_key_down(dir_key)
                             key_is_down = True
 
                     now = time.monotonic()
                     if cast_k and (now - last_k) >= k_interval:
-                        press_skill_once()
+                        # press_skill_once 會放開方向鍵再重新按，更新 driver
+                        fg_key_driver = press_skill_once(
+                            dir_key=None if (bg_mode and hwnd) else dir_key,
+                            dir_driver=fg_key_driver,
+                        )
                         last_k = now
                     time.sleep(0.02)
             finally:
@@ -812,23 +954,26 @@ class MainWindow:
                             if vk is not None:
                                 BackgroundInput.send_vk(hwnd, vk, keyup=True)
                         else:
-                            pyautogui.keyUp(dir_key.lower())
+                            foreground_key_up(dir_key, fg_key_driver)
                     except Exception:
+                        set_status("方向鍵送出失敗：請用管理員身分執行，並確認遊戲在前景")
                         pass
 
         loop_count = 0
         try:
             while not self._stop_flag:
                 loop_count += 1
-                set_status("宏進行中：按住 LEFT…")
-                hold_dir("LEFT", hold_seconds)
-                # 再保險一次釋放所有方向鍵，並稍微讓控制系統有空隙
+                # 每次左右都隨機取不同秒數，避免被偵測到規律
+                secs_l = random.uniform(hold_min, hold_max)
+                secs_r = random.uniform(hold_min, hold_max)
+                set_status(f"宏進行中：按住LEFT {secs_l:.1f}s…")
+                hold_dir("LEFT", secs_l)
                 release_all_dir_keys()
                 time.sleep(switch_gap)
                 if self._stop_flag:
                     break
-                set_status("宏進行中：按住 RIGHT…")
-                hold_dir("RIGHT", hold_seconds)
+                set_status(f"宏進行中：按住RIGHT {secs_r:.1f}s…")
+                hold_dir("RIGHT", secs_r)
                 release_all_dir_keys()
                 time.sleep(switch_gap)
 
@@ -851,7 +996,7 @@ class MainWindow:
 
     def apply_macro_example(self):
         """把常用範例一鍵填好，讓新手知道怎麼用。"""
-        self.hold_seconds_var.set("10")
+        self.hold_seconds_var.set("10-15")
         self.cast_k_var.set(1)
         self.skill_keys_var.set("K,1,2")
         self.k_interval_var.set("0.5")
